@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Daily sync: fetch up to 300 new OANDA transactions after the latest id in BigQuery,
-load into staging, MERGE into oanda.transactions (skip existing ids).
+Daily sync: load new OANDA transactions after the latest id in BigQuery in batches of 300,
+repeated until caught up with the API: TRUNCATE staging, load batch, MERGE into
+oanda.transactions (skip existing ids). Repeats until no new ids remain.
 
 Uses only the standard library plus requests, google-cloud-bigquery, and python-dotenv
 (no pandas/numpy/pyarrow) so macOS code-signing issues with scientific wheels do not apply.
@@ -23,6 +24,7 @@ PROJECT_ID = "bold-artifact-312304"
 DATASET_ID = "oanda"
 TABLE_ID = "transactions"
 STAGING_ID = "transactions_staging"
+BATCH_SIZE = 300
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -368,25 +370,27 @@ def main() -> None:
     ensure_table(client, TABLE_ID)
     ensure_table(client, STAGING_ID)
 
-    max_id = max_stored_transaction_id(client, account_id)
-    start = max_id + 1
-    last_api = oanda_last_transaction_id(api_base, account_id, headers)
-
-    if start > last_api:
-        return
-
-    end = min(start + 299, last_api)
-    payload = fetch_transaction_range(api_base, account_id, headers, start, end)
-    records = transaction_records(payload)
-
-    if not records:
-        return
-
+    start = max_stored_transaction_id(client, account_id) + 1
     staging_ref = f"`{PROJECT_ID}.{DATASET_ID}.{STAGING_ID}`"
-    client.query(f"TRUNCATE TABLE {staging_ref}").result()
-    load_records_to_staging(client, records)
-    merge_staging_into_transactions(client)
-    print(f"Rows added to transactions: {len(records)}")
+
+    while True:
+        last_api = oanda_last_transaction_id(api_base, account_id, headers)
+        if start > last_api:
+            break
+
+        end = min(start + BATCH_SIZE - 1, last_api)
+        payload = fetch_transaction_range(api_base, account_id, headers, start, end)
+        records = transaction_records(payload)
+
+        if not records:
+            break
+
+        client.query(f"TRUNCATE TABLE {staging_ref}").result()
+        load_records_to_staging(client, records)
+        merge_staging_into_transactions(client)
+        print(f"Rows added to transactions: {len(records)}")
+
+        start = end + 1
 
 
 if __name__ == "__main__":
