@@ -1,4 +1,4 @@
-# Weekly OANDA → BigQuery sync
+# OANDA → BigQuery sync (Tue–Fri ~5 PM America/Los_Angeles; see cron comment)
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #   GCP_SA_JSON          Full JSON of a GCP service account key with BigQuery
@@ -14,8 +14,9 @@ name: Sync OANDA transactions
 
 on:
   schedule:
-    # Monday 06:00 UTC — change cron as needed
-    - cron: "0 6 * * 1"
+    # 00:00 UTC Wed–Sat = Tue–Fri 5:00 PM Pacific during PDT (UTC−7). GitHub has no TZ in cron;
+    # during PST (UTC−8) this fires at 4:00 PM Pacific — set hour to 1 for 5 PM in winter instead.
+    - cron: "0 0 * * 3-6"
   workflow_dispatch:
 
 permissions:
