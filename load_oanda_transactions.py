@@ -2,15 +2,18 @@
 """
 Daily sync: fetch up to 100 new OANDA transactions after the latest id in BigQuery,
 load into staging, MERGE into oanda.transactions (skip existing ids).
-Requires: pip install google-cloud-bigquery pandas requests python-dotenv pyarrow
+
+Uses only the standard library plus requests, google-cloud-bigquery, and python-dotenv
+(no pandas/numpy/pyarrow) so macOS code-signing issues with scientific wheels do not apply.
 """
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-import pandas as pd
 import requests
 from dotenv import load_dotenv
 from google.api_core.exceptions import NotFound
@@ -137,140 +140,199 @@ def flatten_dict(d: dict, parent_key: str = "", sep: str = "_") -> dict:
     return out
 
 
-def transactions_dataframe(payload: dict) -> pd.DataFrame:
-    transactions = payload.get("transactions") or []
-    main_records: list[dict] = []
+def _flatten_transaction(txn: dict) -> dict:
+    txn_copy = dict(txn)
+    txn_copy.pop("tradesClosed", None)
+    full_price = txn_copy.get("fullPrice")
+    if full_price and isinstance(full_price, dict):
+        simple = {k: v for k, v in full_price.items() if k not in ("bids", "asks")}
+        fp_flat = {f"fullPrice_{k}": v for k, v in simple.items()}
+    else:
+        fp_flat = {}
+    txn_copy.pop("fullPrice", None)
 
-    for txn in transactions:
-        txn_copy = txn.copy()
-        txn_copy.pop("tradesClosed", None)
-        full_price = txn_copy.get("fullPrice")
-        if full_price:
-            simple = {k: v for k, v in full_price.items() if k not in ("bids", "asks")}
-            fp_flat = {f"fullPrice_{k}": v for k, v in simple.items()}
+    flat: dict = {}
+    for key, value in txn_copy.items():
+        if isinstance(value, dict):
+            flat.update(flatten_dict(value, parent_key=key))
         else:
-            fp_flat = {}
-        txn_copy.pop("fullPrice", None)
+            flat[key] = value
+    flat.update(fp_flat)
+    return flat
 
-        flat: dict = {}
-        for key, value in txn_copy.items():
-            if isinstance(value, dict):
-                flat.update(flatten_dict(value, parent_key=key))
+
+def _to_int(x: Any, default: int = 0) -> int:
+    if x is None or x == "":
+        return default
+    try:
+        return int(round(float(x)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(x: Any, default: float = 0.0) -> float:
+    if x is None or x == "":
+        return default
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_bq_datetime(s: str | None) -> datetime | None:
+    """Parse OANDA-style timestamp into naive UTC wall clock for BigQuery DATETIME."""
+    if not s or not isinstance(s, str):
+        return None
+    s = truncate_timestamp_to_seconds(s.strip())
+    if not s:
+        return None
+    s_iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(s_iso)
+    except ValueError:
+        try:
+            return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _normalize_row(flat: dict) -> dict[str, Any] | None:
+    raw_id = flat.get("id")
+    if raw_id is None:
+        return None
+    try:
+        tid = int(round(float(raw_id)))
+    except (TypeError, ValueError):
+        return None
+
+    def g(key: str, default: Any = None) -> Any:
+        v = flat.get(key)
+        return default if v is None else v
+
+    fp_raw = g("fullPrice_timestamp")
+    if fp_raw is None or fp_raw == "":
+        fp_s = "1111-11-11T11:11:11"
+    else:
+        fp_s = truncate_timestamp_to_seconds(str(fp_raw)) or "1111-11-11T11:11:11"
+
+    time_raw = g("time")
+    time_s = truncate_timestamp_to_seconds(str(time_raw)) if time_raw is not None else ""
+
+    ab = g("accountBalance")
+    if ab is None:
+        account_balance = -1.0
+    else:
+        account_balance = _to_float(ab, -1.0)
+
+    return {
+        "id": tid,
+        "accountID": str(g("accountID", "") or ""),
+        "userID": _to_int(g("userID"), 0),
+        "time": _parse_bq_datetime(time_s) if time_s else None,
+        "batchID": _to_int(g("batchID"), 0),
+        "orderID": _to_int(g("orderID"), 0),
+        "tradeID": _to_int(g("tradeID"), 0),
+        "tradeOpened_tradeID": _to_int(g("tradeOpened_tradeID"), 0),
+        "requestID": _to_int(g("requestID"), 0),
+        "tradeCloseTransactionID": _to_int(g("tradeCloseTransactionID"), 0),
+        "positionFill": str(g("positionFill", "") or ""),
+        "closedTradeID": _to_int(g("closedTradeID"), 0),
+        "type": str(g("type", "") or ""),
+        "accountBalance": account_balance,
+        "pl": _to_float(g("pl"), 0.0),
+        "instrument": str(g("instrument", "") or ""),
+        "units": _to_int(g("units"), 0),
+        "requestedUnits": _to_int(g("requestedUnits"), 0),
+        "tradeOpened_units": _to_int(g("tradeOpened_units"), 0),
+        "price": _to_float(g("price"), 0.0),
+        "halfSpreadCost": _to_float(g("halfSpreadCost"), 0.0),
+        "fullVWAP": _to_float(g("fullVWAP"), 0.0),
+        "reason": str(g("reason", "") or ""),
+        "fullPrice_timestamp": _parse_bq_datetime(fp_s),
+        "tradeOpened_initialMarginRequired": _to_float(
+            g("tradeOpened_initialMarginRequired"), 0.0
+        ),
+        "_loadedAt": datetime.now(timezone.utc),
+    }
+
+
+def transaction_records(payload: dict) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for txn in payload.get("transactions") or []:
+        if not isinstance(txn, dict):
+            continue
+        norm = _normalize_row(_flatten_transaction(txn))
+        if norm is not None:
+            rows.append(norm)
+    return rows
+
+
+def _is_missing_json_value(val: object) -> bool:
+    if val is None:
+        return True
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return True
+    return False
+
+
+def rows_for_bigquery_json(normalized: list[dict[str, Any]]) -> list[dict[str, object]]:
+    type_by_col = {f.name: f.field_type for f in transactions_schema()}
+    out: list[dict[str, object]] = []
+
+    for row in normalized:
+        rec: dict[str, object] = {}
+        for name, val in row.items():
+            ft = type_by_col.get(name, "STRING")
+            if _is_missing_json_value(val):
+                rec[name] = None
+                continue
+
+            if ft == "TIMESTAMP":
+                if not isinstance(val, datetime):
+                    rec[name] = None
+                    continue
+                ts = val
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                else:
+                    ts = ts.astimezone(timezone.utc)
+                rec[name] = ts.strftime("%Y-%m-%d %H:%M:%S.%f") + " UTC"
+            elif ft == "DATETIME":
+                if not isinstance(val, datetime):
+                    rec[name] = None
+                else:
+                    rec[name] = val.strftime("%Y-%m-%d %H:%M:%S")
+            elif ft == "INTEGER":
+                rec[name] = _to_int(val, 0)
+            elif ft == "FLOAT":
+                try:
+                    fv = float(val)
+                    if math.isnan(fv) or math.isinf(fv):
+                        rec[name] = None
+                    else:
+                        rec[name] = fv
+                except (TypeError, ValueError):
+                    rec[name] = None
             else:
-                flat[key] = value
-        flat.update(fp_flat)
-        main_records.append(flat)
-
-    if not main_records:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(main_records)
-    cols = [
-        "id",
-        "accountID",
-        "userID",
-        "time",
-        "batchID",
-        "orderID",
-        "tradeID",
-        "tradeOpened_tradeID",
-        "requestID",
-        "tradeCloseTransactionID",
-        "positionFill",
-        "closedTradeID",
-        "type",
-        "accountBalance",
-        "pl",
-        "instrument",
-        "units",
-        "requestedUnits",
-        "tradeOpened_units",
-        "price",
-        "halfSpreadCost",
-        "fullVWAP",
-        "reason",
-        "fullPrice_timestamp",
-        "tradeOpened_initialMarginRequired",
-    ]
-    df = df.reindex(columns=cols)
-    df["userID"] = df["userID"].fillna(0)
-    df["batchID"] = df["batchID"].fillna(0)
-    df["type"] = df["type"].fillna("").astype(str)
-    df["accountID"] = df["accountID"].fillna("").astype(str)
-
-    df["fullPrice_timestamp"] = df["fullPrice_timestamp"].fillna("1111-11-11T11:11:11")
-    df["orderID"] = df["orderID"].fillna(0)
-    df["instrument"] = df["instrument"].fillna("")
-    df["closedTradeID"] = df["closedTradeID"].fillna(0)
-    df["tradeCloseTransactionID"] = df["tradeCloseTransactionID"].fillna(0)
-    df["requestID"] = df["requestID"].fillna(0)
-    df["tradeOpened_initialMarginRequired"] = df["tradeOpened_initialMarginRequired"].fillna(0)
-    df["positionFill"] = df["positionFill"].fillna("")
-    df["tradeOpened_tradeID"] = df["tradeOpened_tradeID"].fillna(0)
-    df["tradeOpened_units"] = df["tradeOpened_units"].fillna(0)
-    df["tradeID"] = df["tradeID"].fillna(0)
-    df["fullVWAP"] = df["fullVWAP"].fillna(0)
-    df["units"] = pd.to_numeric(df["units"], errors="coerce").round().fillna(0).astype("Int64")
-    df["requestedUnits"] = df["requestedUnits"].fillna(0)
-    df["price"] = df["price"].fillna(0)
-    df["pl"] = df["pl"].fillna(0)
-    df["halfSpreadCost"] = df["halfSpreadCost"].fillna(0)
-    df["reason"] = df["reason"].fillna("")
-    df["accountBalance"] = df["accountBalance"].fillna(-1.0)
-
-    df["time"] = df["time"].map(truncate_timestamp_to_seconds)
-    df["fullPrice_timestamp"] = df["fullPrice_timestamp"].map(truncate_timestamp_to_seconds)
-
-    loaded = datetime.now(timezone.utc)
-    df["_loadedAt"] = loaded
-
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df["fullPrice_timestamp"] = pd.to_datetime(df["fullPrice_timestamp"], errors="coerce")
-
-    df["id"] = pd.to_numeric(df["id"], errors="coerce")
-    df = df.dropna(subset=["id"])
-    df["id"] = df["id"].astype("int64")
-    int_cols = [
-        "userID",
-        "batchID",
-        "orderID",
-        "tradeID",
-        "tradeOpened_tradeID",
-        "requestID",
-        "tradeCloseTransactionID",
-        "closedTradeID",
-        "units",
-        "requestedUnits",
-        "tradeOpened_units",
-    ]
-    for c in int_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
-
-    float_cols = [
-        "accountBalance",
-        "pl",
-        "price",
-        "halfSpreadCost",
-        "fullVWAP",
-        "tradeOpened_initialMarginRequired",
-    ]
-    for c in float_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype("float64")
-
-    return df
+                rec[name] = str(val)
+        out.append(rec)
+    return out
 
 
-def load_dataframe_to_staging(client: bigquery.Client, df: pd.DataFrame) -> None:
-    if df.empty:
+def load_records_to_staging(client: bigquery.Client, records: list[dict[str, Any]]) -> None:
+    if not records:
         return
     table_ref = f"{PROJECT_ID}.{DATASET_ID}.{STAGING_ID}"
-    job = client.load_table_from_dataframe(
-        df,
+    rows = rows_for_bigquery_json(records)
+    job = client.load_table_from_json(
+        rows,
         table_ref,
         job_config=bigquery.LoadJobConfig(
             schema=transactions_schema(),
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         ),
     )
@@ -315,15 +377,16 @@ def main() -> None:
 
     end = min(start + 99, last_api)
     payload = fetch_transaction_range(api_base, account_id, headers, start, end)
-    df = transactions_dataframe(payload)
+    records = transaction_records(payload)
 
-    if df.empty:
+    if not records:
         return
 
     staging_ref = f"`{PROJECT_ID}.{DATASET_ID}.{STAGING_ID}`"
     client.query(f"TRUNCATE TABLE {staging_ref}").result()
-    load_dataframe_to_staging(client, df)
+    load_records_to_staging(client, records)
     merge_staging_into_transactions(client)
+    print(f"Rows added to transactions: {len(records)}")
 
 
 if __name__ == "__main__":
