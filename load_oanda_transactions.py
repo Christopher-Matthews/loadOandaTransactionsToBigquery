@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Daily sync: fetch up to 100 new OANDA transactions after the latest id in BigQuery,
+Daily sync: fetch up to 300 new OANDA transactions after the latest id in BigQuery,
 load into staging, MERGE into oanda.transactions (skip existing ids).
 
 Uses only the standard library plus requests, google-cloud-bigquery, and python-dotenv
@@ -375,7 +375,7 @@ def main() -> None:
     if start > last_api:
         return
 
-    end = min(start + 99, last_api)
+    end = min(start + 299, last_api)
     payload = fetch_transaction_range(api_base, account_id, headers, start, end)
     records = transaction_records(payload)
 
