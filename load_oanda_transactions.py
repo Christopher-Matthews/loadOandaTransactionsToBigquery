@@ -29,6 +29,26 @@ BATCH_SIZE = 300
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
+def _clean_env_value(name: str, required: bool = True) -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        if required:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return ""
+
+    value = raw.strip()
+    # Allow users to paste quoted values in .env/GitHub Secrets.
+    if (
+        len(value) >= 2
+        and ((value[0] == "'" and value[-1] == "'") or (value[0] == '"' and value[-1] == '"'))
+    ):
+        value = value[1:-1].strip()
+
+    if required and not value:
+        raise RuntimeError(f"Environment variable {name} is empty after trimming.")
+    return value
+
+
 def _credentials_path() -> str:
     return os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", str(SCRIPT_DIR / "ba.json"))
 
@@ -359,9 +379,9 @@ def merge_staging_into_transactions(client: bigquery.Client) -> None:
 def main() -> None:
     load_dotenv(SCRIPT_DIR / ".env")
 
-    token = os.environ["OANDA_ACCESS_TOKEN"]
-    account_id = os.environ["OANDA_ACCOUNT_ID"]
-    api_base = os.environ.get("OANDA_API_BASE") or "https://api-fxtrade.oanda.com"
+    token = _clean_env_value("OANDA_ACCESS_TOKEN")
+    account_id = _clean_env_value("OANDA_ACCOUNT_ID")
+    api_base = _clean_env_value("OANDA_API_BASE", required=False) or "https://api-fxtrade.oanda.com"
 
     headers = {"Authorization": f"Bearer {token}"}
     client = bq_client()
